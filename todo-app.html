@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI To‑Do — Full</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+  <style>
+    /* Small customizations */
+    .task-card { transition: box-shadow .12s, transform .12s; }
+    .task-card:hover { transform: translateY(-4px); box-shadow: 0 6px 18px rgba(0,0,0,.08); }
+    .scrollbar-thin::-webkit-scrollbar { height:8px; width:8px; }
+  </style>
+</head>
+<body class="antialiased bg-gradient-to-b from-neutral-50 to-neutral-100 dark:from-neutral-900 dark:to-neutral-800 text-neutral-900 dark:text-neutral-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+
+const { useState, useEffect, useRef } = React;
+
+// Utilities
+const uid = () => crypto.randomUUID?.() || Math.random().toString(36).slice(2,9);
+const nowISO = () => new Date().toISOString();
+const formatDateTimeLocal = (iso) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2,'0');
+  const min = String(d.getMinutes()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
+};
+const parseISOToReadable = (iso) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+const STORAGE_KEY = 'ai_todo_full_v1';
+const THEME_KEY = 'ai_todo_theme_v1';
+
+function useLocalStorage(key, initial) {
+  const [state, setState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : initial;
+    } catch { return initial; }
+  });
+  useEffect(() => localStorage.setItem(key, JSON.stringify(state)), [key, state]);
+  return [state, setState];
+}
+
+// Notification scheduler (best-effort; works only while page open)
+let notificationTimers = {};
+function scheduleNotification(task, when) {
+  if (!("Notification" in window)) return;
+  const id = task.id;
+  const ms = when - Date.now();
+  if (ms <= 0) return;
+  if (notificationTimers[id]) clearTimeout(notificationTimers[id]);
+  notificationTimers[id] = setTimeout(() => {
+    new Notification(task.text || 'Reminder', { body: task.notes || 'Task reminder', tag: id });
+    delete notificationTimers[id];
+  }, ms);
+}
+function cancelScheduledNotification(id) {
+  if (notificationTimers[id]) { clearTimeout(notificationTimers[id]); delete notificationTimers[id]; }
+}
+
+// Main App
+function App(){
+  const [tasks, setTasks] = useLocalStorage(STORAGE_KEY, []);
+  const [theme, setTheme] = useLocalStorage(THEME_KEY, 'system');
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState('all'); // all, active, completed, overdue
+  const [sortBy, setSortBy] = useState('manual'); // manual, due, priority, created, progress
+  const listRef = useRef(null);
+  const sortableRef = useRef(null);
+
+  useEffect(() => {
+    // Apply theme
+    if (theme === 'dark') document.documentElement.classList.add('dark');
+    else if (theme === 'light') document.documentElement.classList.remove('dark');
+    else {
+      // system
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) document.documentElement.classList.add('dark');
+      else document.documentElement.classList.remove('dark');
+    }
+  }, [theme]);
+
+  // Restore timers for reminders
+  useEffect(() => {
+    // ask for permission
+    if ("Notification" in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(()=>{});
+    }
+    // schedule upcoming reminders
+    for (const t of tasks) {
+      if (t.reminder && t.due) {
+        const when = new Date(t.due).getTime() - (Number(t.reminder)||0)*60000;
+        if (when > Date.now()) scheduleNotification(t, when);
+      }
+    }
+    // cleanup on unmount
+    return () => { Object.keys(notificationTimers).forEach(k=>cancelScheduledNotification(k)); }
+  }, []);
+
+  useEffect(() => {
+    // keep timers in sync when tasks change
+    for (const t of tasks) {
+      if (t.reminder && t.due) {
+        const when = new Date(t.due).getTime() - (Number(t.reminder)||0)*60000;
+        if (when > Date.now()) scheduleNotification(t, when);
+      } else cancelScheduledNotification(t.id);
+    }
+  }, [tasks]);
+
+  useEffect(() => {
+    // init Sortable for manual reordering
+    if (!listRef.current) return;
+    if (sortableRef.current) sortableRef.current.destroy();
+    sortableRef.current = Sortable.create(listRef.current, {
+      animation: 150,
+      handle: '.drag-handle',
+      onEnd: (evt) => {
+        const oldIndex = evt.oldIndex;
+        const newIndex = evt.newIndex;
+        if (oldIndex == null || newIndex == null) return;
+        const copy = [...tasks];
+        const [moved] = copy.splice(oldIndex,1);
+        copy.splice(newIndex,0,moved);
+        setTasks(copy);
+      }
+    });
+    return () => { /* cleanup happens on next init */ };
+  }, [tasks, listRef.current]);
+
+  // Stats & progress
+  const total = tasks.length;
+  const completed = tasks.filter(t=>t.done).length;
+  const progress = total? Math.round(completed/total*100) : 0;
+
+  function addTask(template){
+    const base = {
+      id: uid(), text: template?.text||'New task', notes: template?.notes||'', due: template?.due||'', priority: template?.priority||'medium',
+      subtasks: template?.subtasks||[], done: false, createdAt: new Date().toISOString(), reminder: template?.reminder||'', recurrence: template?.recurrence||'none'
+    };
+    setTasks(prev => [base, ...prev]);
+  }
+
+  function updateTask(id, patch){
+    setTasks(prev => prev.map(t => t.id===id ? {...t,...patch} : t));
+  }
+  function removeTask(id){
+    cancelScheduledNotification(id);
+    setTasks(prev => prev.filter(t=>t.id!==id));
+  }
+
+  function clearCompleted(){ setTasks(prev => prev.filter(t=>!t.done)); }
+
+  function exportJSON(){
+    const data = JSON.stringify(tasks, null, 2);
+    const blob = new Blob([data], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'tasks.json'; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importJSON(file){
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try{
+        const parsed = JSON.parse(e.target.result);
+        if (Array.isArray(parsed)) setTasks(parsed);
+        else alert('Invalid file - root should be an array');
+      }catch(err){ alert('Error parsing JSON: '+err.message) }
+    };
+    reader.readAsText(file);
+  }
+
+  // Sorting & filtering pipeline
+  let shown = tasks.filter(t => {
+    if (filter==='active') return !t.done;
+    if (filter==='completed') return t.done;
+    if (filter==='overdue') return t.due && !t.done && new Date(t.due) < new Date();
+    return true;
+  }).filter(t=> t.text.toLowerCase().includes(query.toLowerCase()) || (t.notes||'').toLowerCase().includes(query.toLowerCase()));
+
+  if (sortBy==='due') shown.sort((a,b)=> (a.due||'').localeCompare(b.due||''));
+  if (sortBy==='priority'){ const order = {high:0, medium:1, low:2}; shown.sort((a,b)=> (order[a.priority]||1)-(order[b.priority]||1)); }
+  if (sortBy==='created') shown.sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt));
+  if (sortBy==='progress') shown.sort((a,b)=> (Number(a.subtasks?.filter(s=>s.done).length)||0)/(a.subtasks?.length||1) - (Number(b.subtasks?.filter(s=>s.done).length)||0)/(b.subtasks?.length||1));
+
+  // Recurrence handler: when marking done, optionally create next occurrence
+  function handleToggleDone(t){
+    const newDone = !t.done;
+    updateTask(t.id, {done: newDone});
+    if (newDone && t.recurrence && t.recurrence!=='none' && t.due){
+      // create next occurrence depending on rule
+      const currentDue = new Date(t.due);
+      let next = new Date(currentDue);
+      if (t.recurrence==='daily') next.setDate(next.getDate()+1);
+      if (t.recurrence==='weekly') next.setDate(next.getDate()+7);
+      if (t.recurrence==='monthly') next.setMonth(next.getMonth()+1);
+      const newTaskObj = {...t, id: uid(), done:false, createdAt: new Date().toISOString(), due: next.toISOString()};
+      setTasks(prev => [newTaskObj, ...prev]);
+    }
+  }
+
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-5xl mx-auto">
+        <header className="flex items-center justify-between gap-4 mb-6">
+          <div>
+            <h1 className="text-2xl font-bold">✨ AI To‑Do — Full</h1>
+            <p className="text-sm text-neutral-500">Due dates, reminders, priorities, subtasks, drag & drop, recurring, export/import, dark mode and more.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="text-sm text-neutral-600">{completed}/{total} done</div>
+            <div className="w-48 bg-neutral-200 dark:bg-neutral-700 rounded-full overflow-hidden h-3">
+              <div style={{width: progress+'%'}} className="h-3 bg-gradient-to-r from-green-400 to-blue-500"></div>
+            </div>
+            <ThemeToggle theme={theme} setTheme={setTheme} />
+            <button className="px-3 py-2 rounded-lg border" onClick={()=>{ exportJSON() }}>Export</button>
+            <label className="px-3 py-2 rounded-lg border cursor-pointer">
+              Import <input type="file" accept="application/json" style={{display:'none'}} onChange={(e)=> importJSON(e.target.files[0])} />
+            </label>
+          </div>
+        </header>
+
+        <main className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="md:col-span-1 space-y-4">
+            <AddTaskPanel onAdd={addTask} />
+            <div className="bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm">
+              <div className="flex gap-2 mb-2">
+                <input className="flex-1 px-3 py-2 rounded-lg border" placeholder="Search tasks or notes..." value={query} onChange={(e)=>setQuery(e.target.value)} />
+              </div>
+              <div className="flex flex-wrap gap-2 text-sm">
+                <select className="px-3 py-2 rounded-lg border" value={filter} onChange={(e)=>setFilter(e.target.value)}>
+                  <option value="all">All</option>
+                  <option value="active">Active</option>
+                  <option value="completed">Completed</option>
+                  <option value="overdue">Overdue</option>
+                </select>
+                <select className="px-3 py-2 rounded-lg border" value={sortBy} onChange={(e)=>setSortBy(e.target.value)}>
+                  <option value="manual">Manual</option>
+                  <option value="due">Due date</option>
+                  <option value="priority">Priority</option>
+                  <option value="created">Newest</option>
+                  <option value="progress">Subtask progress</option>
+                </select>
+                <button className="px-3 py-2 rounded-lg border" onClick={()=> clearCompleted()}>Clear completed</button>
+                <button className="px-3 py-2 rounded-lg border" onClick={()=> {
+                  if (confirm('Reset all tasks? This will remove everything.')) setTasks([]);
+                }}>Reset</button>
+              </div>
+            </div>
+
+            <div className="bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm space-y-2">
+              <h3 className="font-semibold">Tips</h3>
+              <ul className="text-sm text-neutral-500 space-y-1">
+                <li>• Use the drag handle to reorder tasks manually.</li>
+                <li>• Set reminders (minutes before due) to get browser notifications while the page is open.</li>
+                <li>• Recurring tasks create the next occurrence when you mark done.</li>
+                <li>• Export to backup your tasks; import replaces the list.</li>
+              </ul>
+            </div>
+          </div>
+
+          <section className="md:col-span-2 space-y-4">
+            <div ref={listRef} className="space-y-3">
+              {shown.length===0 && <div className="text-center text-neutral-500 p-6 bg-white dark:bg-neutral-900 rounded-xl">No tasks — add one!</div>}
+              {shown.map((t, idx) => (
+                <TaskCard key={t.id} idx={idx} task={t} onUpdate={updateTask} onRemove={removeTask} onToggleDone={()=>handleToggleDone(t)} />
+              ))}
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// Theme Toggle
+function ThemeToggle({theme, setTheme}){
+  return (
+    <select value={theme} onChange={(e)=>setTheme(e.target.value)} className="px-3 py-2 rounded-lg border text-sm">
+      <option value="system">Theme: System</option>
+      <option value="light">Theme: Light</option>
+      <option value="dark">Theme: Dark</option>
+    </select>
+  );
+}
+
+// AddTaskPanel component (with quick-add fields)
+function AddTaskPanel({onAdd}){
+  const [text, setText] = useState('');
+  const [notes, setNotes] = useState('');
+  const [due, setDue] = useState('');
+  const [priority, setPriority] = useState('medium');
+  const [reminder, setReminder] = useState('15');
+  const [recurrence, setRecurrence] = useState('none');
+  function submit(){
+    if (!text.trim()) return alert('Task title required');
+    onAdd({text: text.trim(), notes, due: due? new Date(due).toISOString() : '', priority, reminder: reminder||'', recurrence});
+    setText(''); setNotes(''); setDue(''); setPriority('medium'); setReminder('15'); setRecurrence('none');
+  }
+  return (
+    <div className="bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm space-y-3">
+      <h3 className="font-semibold">Add new task</h3>
+      <input value={text} onChange={(e)=>setText(e.target.value)} placeholder="Task title" className="w-full px-3 py-2 rounded-lg border" />
+      <textarea value={notes} onChange={(e)=>setNotes(e.target.value)} placeholder="Notes (optional)" className="w-full px-3 py-2 rounded-lg border"></textarea>
+      <div className="grid grid-cols-2 gap-2">
+        <input type="datetime-local" value={due} onChange={(e)=>setDue(e.target.value)} className="px-3 py-2 rounded-lg border" />
+        <select value={priority} onChange={(e)=>setPriority(e.target.value)} className="px-3 py-2 rounded-lg border">
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+        <input type="number" value={reminder} onChange={(e)=>setReminder(e.target.value)} className="px-3 py-2 rounded-lg border" placeholder="Reminder minutes before" />
+        <select value={recurrence} onChange={(e)=>setRecurrence(e.target.value)} className="px-3 py-2 rounded-lg border">
+          <option value="none">No repeat</option>
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+        </select>
+      </div>
+      <div className="flex gap-2">
+        <button className="px-4 py-2 rounded-lg bg-blue-600 text-white" onClick={submit}>Add task</button>
+        <button className="px-4 py-2 rounded-lg border" onClick={()=>{ setText(''); setNotes(''); setDue(''); setPriority('medium'); setReminder('15'); setRecurrence('none'); }}>Clear</button>
+      </div>
+    </div>
+  );
+}
+
+// TaskCard with subtasks, edit modal, reminders, drag handle
+function TaskCard({task, onUpdate, onRemove, onToggleDone, idx}){
+  const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(task.text);
+  const [notes, setNotes] = useState(task.notes||'');
+  const [due, setDue] = useState(formatDateTimeLocal(task.due));
+  const [priority, setPriority] = useState(task.priority||'medium');
+  const [reminder, setReminder] = useState(task.reminder||'');
+  const [recurrence, setRecurrence] = useState(task.recurrence||'none');
+  const [subtasks, setSubtasks] = useState(task.subtasks||[]);
+  const addSubRef = useRef(null);
+
+  useEffect(()=>{ setTitle(task.text); setNotes(task.notes||''); setDue(formatDateTimeLocal(task.due)); setPriority(task.priority||'medium'); setReminder(task.reminder||''); setRecurrence(task.recurrence||'none'); setSubtasks(task.subtasks||[]); }, [task.id]);
+
+  function saveEdit(){
+    onUpdate(task.id, { text: title, notes, due: due? new Date(due).toISOString() : '', priority, reminder, recurrence, subtasks });
+    setEditing(false);
+  }
+  function toggleSubtask(i){
+    const copy = subtasks.map((s,idx)=> idx===i? {...s, done: !s.done} : s);
+    setSubtasks(copy);
+    onUpdate(task.id, {subtasks: copy});
+  }
+  function addSubtask(text){
+    if (!text) return;
+    const copy = [{id: uid(), text, done:false}, ...subtasks];
+    setSubtasks(copy); onUpdate(task.id, {subtasks: copy});
+    addSubRef.current.value='';
+  }
+  function removeSub(i){
+    const copy = subtasks.filter((s,idx)=>idx!==i);
+    setSubtasks(copy); onUpdate(task.id, {subtasks: copy});
+  }
+  function scheduleReminderIfNeeded(dueISO, reminderMin){
+    if (reminderMin && dueISO && Notification.permission === 'granted'){
+      const when = new Date(dueISO).getTime() - Number(reminderMin)*60000;
+      if (when > Date.now()) scheduleNotification({...task, text:title, notes}, when);
+    }
+  }
+
+  return (
+    <article className="task-card bg-white dark:bg-neutral-900 p-4 rounded-xl border flex items-start gap-3">
+      <div className="flex-shrink-0 drag-handle cursor-grab p-2 rounded-md text-neutral-400 select-none">☰</div>
+      <div className="flex-1">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <input type="checkbox" checked={task.done} onChange={()=> onToggleDone(task)} className="w-5 h-5" />
+            <div>
+              <div className={`font-medium ${task.done? 'line-through text-neutral-400':''}`}>{task.text}</div>
+              <div className="text-xs text-neutral-500">
+                {task.due ? <span>Due: {parseISOToReadable(task.due)} · </span> : null}
+                {task.priority ? <span>Priority: <strong className={task.priority==='high'?'text-red-500': task.priority==='low'?'text-green-500':'text-yellow-500'}>{task.priority}</strong> · </span> : null}
+                {task.recurrence && task.recurrence!=='none' ? <span>Repeat: {task.recurrence} · </span> : null}
+                <span>Subtasks: {task.subtasks?.length||0}</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button className="px-2 py-1 text-sm border rounded-md" onClick={()=> setExpanded(s=>!s)}>{expanded? 'Collapse':'Details'}</button>
+            <button className="px-2 py-1 text-sm border rounded-md" onClick={()=> setEditing(true)}>Edit</button>
+            <button className="px-2 py-1 text-sm border rounded-md text-red-500" onClick={()=> { if (confirm('Delete task?')) onRemove(task.id); }}>Delete</button>
+          </div>
+        </div>
+
+        {expanded && (
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="col-span-1">
+              <div className="text-sm font-semibold">Notes</div>
+              <div className="text-sm text-neutral-500 whitespace-pre-wrap">{task.notes || '—'}</div>
+            </div>
+            <div className="col-span-1">
+              <div className="text-sm font-semibold">Subtasks</div>
+              <div className="space-y-2 mt-2">
+                {(task.subtasks || []).length===0 ? <div className="text-sm text-neutral-500">No subtasks</div> : (
+                  (task.subtasks||[]).map((s,i)=> (
+                    <div key={s.id} className="flex items-center gap-2">
+                      <input type="checkbox" checked={s.done} onChange={()=> toggleSubtask(i)} />
+                      <div className={s.done? 'line-through text-neutral-400':''}>{s.text}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Edit modal inline */}
+        {editing && (
+          <div className="mt-3 p-3 border rounded-lg bg-neutral-50 dark:bg-neutral-800">
+            <div className="grid grid-cols-1 gap-2">
+              <input value={title} onChange={(e)=>setTitle(e.target.value)} className="px-3 py-2 rounded-lg border" />
+              <textarea value={notes} onChange={(e)=>setNotes(e.target.value)} className="px-3 py-2 rounded-lg border" placeholder="Notes"></textarea>
+              <div className="grid grid-cols-2 gap-2">
+                <input type="datetime-local" value={due} onChange={(e)=>setDue(e.target.value)} className="px-3 py-2 rounded-lg border" />
+                <select value={priority} onChange={(e)=>setPriority(e.target.value)} className="px-3 py-2 rounded-lg border">
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+                <input type="number" value={reminder} onChange={(e)=>setReminder(e.target.value)} className="px-3 py-2 rounded-lg border" placeholder="Reminder mins before" />
+                <select value={recurrence} onChange={(e)=>setRecurrence(e.target.value)} className="px-3 py-2 rounded-lg border">
+                  <option value="none">No repeat</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="monthly">Monthly</option>
+                </select>
+              </div>
+
+              <div className="pt-2 border-t"></div>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <input ref={addSubRef} placeholder="New subtask title" className="flex-1 px-3 py-2 rounded-lg border" />
+                  <button className="px-3 py-2 rounded-lg border" onClick={()=> addSubtask(addSubRef.current.value)}>Add subtask</button>
+                </div>
+                <div className="space-y-2 max-h-40 overflow-auto scrollbar-thin">
+                  {subtasks.map((s,i)=> (
+                    <div key={s.id} className="flex items-center justify-between gap-2 p-2 bg-white rounded-md border">
+                      <div className="flex items-center gap-2">
+                        <input type="checkbox" checked={s.done} onChange={()=> { const copy = subtasks.map((x,ii)=>ii===i?{...x,done:!x.done}:x); setSubtasks(copy); onUpdate(task.id,{subtasks:copy}); }} />
+                        <div className={s.done? 'line-through text-neutral-400':''}>{s.text}</div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button className="px-2 py-1 text-sm border rounded-md" onClick={()=> { const text = prompt('Edit subtask', s.text); if (text!=null){ const copy=subtasks.map((x,ii)=>ii===i?{...x,text}:x); setSubtasks(copy); onUpdate(task.id,{subtasks:copy}); }}}>Edit</button>
+                        <button className="px-2 py-1 text-sm border rounded-md text-red-500" onClick={()=> { const copy = subtasks.filter((x,ii)=>ii!==i); setSubtasks(copy); onUpdate(task.id,{subtasks:copy}); }}>Remove</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex gap-2 justify-end pt-2">
+                <button className="px-3 py-2 rounded-lg border" onClick={()=> setEditing(false)}>Cancel</button>
+                <button className="px-3 py-2 rounded-lg bg-green-600 text-white" onClick={()=> { saveEdit(); scheduleReminderIfNeeded(due?new Date(due).toISOString():'', reminder); }}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+  </script>
+</body>
+</html>
